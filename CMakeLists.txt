@@ -24,7 +24,6 @@ file(GLOB_RECURSE SOURCES
 
 add_library(leveldb_core STATIC ${SOURCES})
 
-# Target include directories for consumers
 target_include_directories(leveldb_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -33,11 +32,23 @@ target_include_directories(leveldb_core PUBLIC
 
 enable_testing()
 
-# Unit tests
+# Fetch GoogleTest
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+)
+# For Windows: Prevent overriding the parent project's compiler/linker settings
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+include(GoogleTest)
+
+# Unit tests using GoogleTest
 file(GLOB TEST_SOURCES "tests/*.cpp")
 foreach(test_src ${TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
-    target_link_libraries(${test_name} PRIVATE leveldb_core)
-    add_test(NAME ${test_name} COMMAND ${test_name})
+    target_link_libraries(${test_name} PRIVATE leveldb_core gtest_main)
+    gtest_discover_tests(${test_name})
 endforeach()
