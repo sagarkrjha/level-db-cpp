@@ -4,6 +4,12 @@ A complete, clean, end-to-end modern C++ (C++20) implementation of the Log-Struc
 
 ---
 
+> [!CAUTION]
+> **DISCLAIMER: EDUCATIONAL & LEARNING PURPOSE ONLY**
+> This repository is created solely for personal educational study and exploratory learning of LSM-tree internals, storage engine mechanics, and C++20 concurrency primitives. It is **not** intended for production environments.
+
+---
+
 ## 🌟 Acknowledgement & Shoutout
 
 > [!NOTE]
@@ -14,57 +20,99 @@ A complete, clean, end-to-end modern C++ (C++20) implementation of the Log-Struc
 
 ## 🏗️ Architecture & Component Overview
 
-```
-                      +-------------------+
-                      |   Client Writes   |
-                      +---------+---------+
-                                |
-               +----------------+----------------+
-               |                                 |
-               v                                 v
-        +--------------+                 +---------------+
-        | Write-Ahead  |                 |    MemTable   |
-        |  Log (WAL)   |                 |  (SkipList)   |
-        +--------------+                 +-------+-------+
-                                                 | (when write_buffer_size reached)
-                                                 v
-                                         +---------------+
-                                         | Immutable     |
-                                         | MemTable      |
-                                         +-------+-------+
-                                                 | (Minor Compaction)
-                                                 v
-    +------------------+                 +---------------+
-    | Manifest /       |<----------------| SSTable L0    |
-    | VersionEdit /    |                 +-------+-------+
-    | VersionSet       |                         | (Major Compaction)
-    +------------------+                         v
-                                         +---------------+
-                                         | SSTable L1..Ln|
-                                         +---------------+
+### End-to-End System Architecture
+
+```mermaid
+flowchart TD
+    Client["Client Write Request\n(Put / Delete / WriteBatch)"] --> WAL["Write-Ahead Log\n(32 KB Chunked Records + CRC)"]
+    Client --> MemTable["Active MemTable\n(SkipList + Arena Memory)"]
+
+    MemTable -->|"Size >= write_buffer_size"| ImmMemTable["Immutable MemTable\n(Frozen for Flush)"]
+    ImmMemTable -->|"Minor Compaction"| L0["SSTable Level 0\n(Overlapping Keys)"]
+
+    subgraph OnDiskStorage ["On-Disk LSM-Tree Hierarchy"]
+        L0 -->|"File Count >= 4 (Major Compaction)"| L1["SSTable Level 1\n(Disjoint Key Ranges, ~10 MB)"]
+        L1 -->|"Size Exceeds Limit (10x growth)"| L2["SSTable Level 2\n(Disjoint Key Ranges, ~100 MB)"]
+        L2 -->|"Compaction Downward"| Ln["SSTable Level N\n(Disjoint Key Ranges, Up to L6)"]
+    end
+
+    subgraph MetadataSystem ["Version Set & Metadata Coordination"]
+        VersionSet["VersionSet Engine"] --- Manifest["MANIFEST-XXXXXX\n(Delta Journal of Added/Deleted Files)"]
+        VersionSet --- Current["CURRENT File\n(Pointer to Active MANIFEST)"]
+        VersionSet -->|"Installs New Version"| L0
+        VersionSet -->|"Installs New Version"| L1
+    end
 ```
 
-### 1. Storage & Memory Pipeline
-* **[Slice](include/leveldb/slice.h)**: Zero-copy read buffer views.
-* **[Arena](src/util/arena.h)** & **[SkipList](src/db/skiplist.h)**: Lock-free lockless read skiplist using atomic pointer operations and memory arena allocation.
-* **[InternalKey](src/db/dbformat.h)**: Multiplexed user key + 56-bit sequence number + 8-bit `ValueType` (`kTypeValue` or `kTypeDeletion`).
-* **[MemTable](src/db/memtable.h)**: In-memory sorted buffer. Provides fast point lookups and range scans.
-* **[WriteBatch](src/db/write_batch.cpp)**: Atomic update batch supporting Put/Delete with linear sequence allocation.
+---
 
-### 2. Write-Ahead Log (WAL)
-* **[LogWriter & LogReader](src/db/log_writer_reader.h)**: 32 KB chunked physical record framing (`kFullType`, `kFirstType`, `kMiddleType`, `kLastType`) with CRC32C integrity masking and recovery resynchronization.
+### SSTable Physical File Format
 
-### 3. SSTable (Sorted String Table Format)
-* **[BlockBuilder](src/table/block_builder.h) & [Block](src/table/block.h)**: Prefix compression (shared / non-shared byte encoding) with configurable restart intervals (default: 16) and binary search across restart points.
-* **[Bloom Filter](src/table/filter_block.cpp)**: Double-hashing Bloom Filter (`k = bits_per_key * ln(2)`) to eliminate disk seeks for absent keys.
-* **[TableBuilder](src/table/table_builder.h) & [Table](src/table/table.h)**: Complete LevelDB on-disk SSTable layout: Data Blocks -> Filter Block -> MetaIndex Block -> Index Block -> 48-byte fixed Footer with magic `0xdb4775248b80fb57`.
+```mermaid
+flowchart TB
+    subgraph SSTableFile ["SSTable Physical File Layout (*.ldb)"]
+        direction TB
+        DB1["Data Block 1\n(Prefix-compressed Key/Value Entries + Restart Array)"]
+        DB2["Data Block 2\n(Prefix-compressed Key/Value Entries + Restart Array)"]
+        DBN["Data Block N..."]
+        FB["Filter Block\n(Double-hashing Bloom Filter for Fast Negative Lookup)"]
+        MB["MetaIndex Block\n(Maps 'filter.leveldb.BuiltinBloomFilter2' -> Filter Block Handle)"]
+        IB["Index Block\n(Maps Block Separator Keys -> Data Block Handles)"]
+        FT["48-byte Fixed Footer\n(MetaIndex Handle + Index Handle + Magic: 0xdb4775248b80fb57)"]
 
-### 4. Compaction & Version Management
-* **[VersionEdit](src/db/version_edit.h)**: Atomic delta journal log (added SSTable files, deleted SSTable files, next file ID, last sequence number).
-* **[VersionSet](src/db/version_set.h)**: MVCC version chain management, MANIFEST file logger, and `CURRENT` pointer management.
-* **Compaction Engine**:
-  * **Minor Compaction**: Flushes immutable in-memory MemTable directly into Level 0 SSTables.
-  * **Major Compaction**: Detects score threshold exceedances (`L0 >= 4` files, or size limits on levels L1..L6), merges disjoint/overlapping tables using `MergingIterator`, deduplicates shadowed sequence numbers, purges deleted tombstones, and emits new sorted SSTable extents.
+        DB1 --> DB2 --> DBN --> FB --> MB --> IB --> FT
+    end
+```
+
+---
+
+### Read Path Hierarchy
+
+```mermaid
+flowchart LR
+    ReadReq["db->Get(key)"] --> CheckMem["1. Check Active MemTable"]
+    CheckMem -->|"Found / Deleted"| ReturnResult["Return Value / NotFound"]
+    CheckMem -->|"Not Found"| CheckImm["2. Check Immutable MemTable"]
+    CheckImm -->|"Found / Deleted"| ReturnResult
+    CheckImm -->|"Not Found"| CheckL0["3. Check Level 0 Files\n(Newest to Oldest)"]
+    CheckL0 -->|"Bloom Filter + Block Lookup"| FoundL0{"Found?"}
+    FoundL0 -->|"Yes"| ReturnResult
+    FoundL0 -->|"No"| CheckL1["4. Binary Search Levels 1..N\n(Disjoint Files)"]
+    CheckL1 -->|"Bloom Filter + TwoLevelIterator"| FoundLn{"Found?"}
+    FoundLn -->|"Yes"| ReturnResult
+    FoundLn -->|"No"| FinalNotFound["Return Status::NotFound"]
+```
+
+---
+
+## 📝 Design Decisions & Engineering Observations
+
+### 1. InternalKey Representation
+* **Key Encoding**:
+  $$\text{InternalKey} = [\text{User Key Bytes}] + [(\text{Sequence Number} \ll 8) \mid \text{ValueType}]$$
+* **Ordering Logic**:
+  1. `user_key` ascending (bytewise lexicographical).
+  2. `sequence_number` **descending** (higher sequence numbers are newer, hence sorted first).
+  3. `ValueType` descending (`kTypeValue = 1`, `kTypeDeletion = 0`).
+* **Observation**: Seeking to $(K, \text{SnapshotSeq}, \text{kValueTypeForSeek})$ lands directly on the most recent visible update at or before the snapshot sequence number without needing backward scans.
+
+### 2. SkipList vs. Balanced Trees
+* **Observation**: SkipLists allow concurrent readers without mutex locking via release/acquire memory barriers (`std::memory_order_release` and `std::memory_order_acquire`).
+* Combined with a dedicated memory `Arena`, individual node deallocations are eliminated; memory is reclaimed in a single sweep when the `MemTable` reference drops to zero.
+
+### 3. Prefix Compression & Binary Search
+* SSTable data blocks use delta prefix compression:
+  `[shared_len][unshared_len][val_len][unshared_key_bytes][val_bytes]`.
+* Every 16 entries (configurable restart interval), a full uncompressed key is stored and its offset recorded in a restart table. This permits $O(\log(\text{restarts}))$ binary search across blocks.
+
+### 4. Bloom Filter Disk I/O Pruning
+* SSTables write a Bloom filter bitset alongside data blocks using double hashing ($g_i(x) = (h_1 + i \cdot h_2) \pmod m$).
+* At 10 bits per key, negative queries are filtered with $\approx 99\%$ accuracy, eliminating unnecessary random disk seeks.
+
+### 5. Compactions & Tombstone Purging
+* **Minor Compaction**: Directly dumps the frozen immutable `MemTable` into Level 0.
+* **Major Compaction**: Detects score threshold exceedances (`L0 >= 4` files, or level size limits) and merges overlapping files down to $L_{i+1}$ using a `MergingIterator`.
+* **Tombstone Safety Rule**: Deletions (`kTypeDeletion`) are only discarded during compaction when merged into the deepest level ($L_{\text{max}}$); dropping them earlier risks resurrecting older values from lower levels.
 
 ---
 
